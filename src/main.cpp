@@ -35,6 +35,27 @@ float mmHg_prev = 0;
 float systole = 0;
 float diastole = 0;
 int mark = 0;
+// === Parameters ===
+const int MA_LEN = 5;
+const float TARGET_PRESSURE = 170;
+const float SAFETY_MAX = 180;
+const float MIN_PRESSURE = 30;
+const int DEF_SAMPLE_INTERVAL = 50; // ms
+const int HOLD_TIME = 15000;        // 15 seconds total measurement
+const int VALVE_OPEN_INTERVAL = 3000; // open every 4 sec
+const int VALVE_OPEN_DURATION = 500; // keep open for 1 sec
+const float PRESSURE_TOPUP_THRESHOLD = 2.0;
+
+// === Calibration from manometer ===
+const float ADC_ZERO = 714;
+const float ADC_REF = 4825;
+const float BP_REF = 90.0;
+const float mmHg_per_adc = BP_REF / (ADC_REF - ADC_ZERO);
+
+// Moving average buffer
+float pressureBuffer[MA_LEN] = {0};
+int bufferIndex = 0;
+
 
 // ===================== DISPLAY (TFT_eSPI) =====================
 TFT_eSPI tft = TFT_eSPI(); // Uses User_Setup in TFT_eSPI library
@@ -189,6 +210,37 @@ void loop() {
 
 // =====================================================
 // 🌡️ TEMPERATURE MEASUREMENT
+/*
+  measureTemperature()
+
+  Purpose:
+  - Read the MLX90614 ambient and object (IR) temperatures for a short
+    averaging window and store the averaged values for display.
+
+  Behaviour / algorithm:
+  - Runs a 2-second sampling loop, collecting ambient and object readings
+    from the MLX90614 approximately every 200 ms.
+  - Sums samples and computes the arithmetic mean at the end. Uses the
+    averaged values to update global last_ambient / last_object for the
+    main UI.
+
+  Side effects:
+  - Updates the LVGL measurement screen via loadMeasurementScreen() and
+    updateMeasurementScreen() helpers so the UI shows progress and result.
+  - Writes the computed averages to the globals `last_ambient` and
+    `last_object` for later display on the main screen.
+
+  Timing & blocking:
+  - This function is blocking: it delays inside the sampling loop (200 ms
+    per sample) and calls to LVGL functions to keep the UI responsive. The
+    whole operation takes ~2 seconds + small overhead.
+
+  Edge cases & error handling:
+  - If the sensor returns NaN (mlx returns NaN on error), the code treats
+    that sample as NaN and the displayed value becomes '-' using the
+    formatting helper. The averaging still divides by the sample count to
+    avoid division by zero.
+*/
 void measureTemperature() {
   // Prepare UI: load measurement screen once and then update labels in the loop
   loadMeasurementScreen("Temperature", "Preparing...", "");
@@ -251,14 +303,53 @@ void measureTemperature() {
 
 // =====================================================
 // ❤️ HEART RATE + SPO2 MEASUREMENT
+/*
+  measureHeartSpO2()
+
+  Purpose:
+  - Collect photoplethysmogram (PPG) data from the MAX30102 (via the
+    DFRobot wrapper) for a short window and compute heart rate and SpO2.
+
+  Behaviour / algorithm:
+  - Starts data collection using `spo2Sensor.sensorStartCollect()`.
+  - Waits for a fixed duration (4 seconds) while showing a countdown on
+    the display. This window is used by the underlying DFRobot library to
+    accumulate samples.
+  - After the collection window, calls `spo2Sensor.getHeartbeatSPO2()` to
+    trigger the library's signal processing and then reads the result from
+    `spo2Sensor._sHeartbeatSPO2` structure.
+
+  Side effects:
+  - Updates `last_spo2`, `last_heart`, and `last_sensor_temp` globals with
+    numeric results. Calls `spo2Sensor.sensorEndCollect()` to stop
+    acquisition/cleanup.
+  - Updates the LVGL measurement screen to show progress and final values.
+
+  Timing & blocking:
+  - The function blocks for the duration of the collection window (~4s)
+    plus small delays used for UI updates. The underlying sensor library may
+    use interrupts or internal buffers but this wrapper blocks while
+    waiting for the window to finish.
+
+  Edge cases & error handling:
+  - The function assumes the DFRobot library was initialized successfully
+    in setup(). If the library fails or returns invalid values, the
+    recorded values may be zero or NaN — you should validate the sensor
+    placement and library docs if results are unstable.
+*/
 void measureHeartSpO2() {
   Serial.println("\n[Heart Rate & SpO2 Measurement]");
   // use load/update helpers so UI stays responsive and we don't reload screen every loop
   loadMeasurementScreen("Heart/SpO2", "Collecting...", "");
   spo2Sensor.sensorStartCollect();
+  const unsigned long duration = 4000;
   unsigned long start = millis();
-  while (millis() - start < 4000) {
-    updateMeasurementScreen("Collecting...", String((millis() - start) / 1000) + "s");
+  while (millis() - start < duration) {
+    unsigned long elapsed = millis() - start;
+    unsigned long remaining_ms = (elapsed >= duration) ? 0 : (duration - elapsed);
+    // show highest whole-second at start (ceil) so user sees 4s -> 3s -> 2s -> 1s -> 0s
+    unsigned long remaining_s = (remaining_ms + 999) / 1000;
+    updateMeasurementScreen("Collecting...", String(remaining_s) + "s");
     delay(250);
   }
   spo2Sensor.getHeartbeatSPO2();
@@ -283,124 +374,309 @@ void measureHeartSpO2() {
   showMainScreen();
 }
 
-// 🧮 READ PRESSURE (MPX5050DP)
+// --- Read pressure with smoothing ---
 float readPressureSensor() {
-  int16_t raw = ads.readADC_SingleEnded(0);
-  float voltage = raw * 0.1875 / 1000;  // ADS1115 conversion to volts
-  float pressure_kPa = (voltage / 5.0 - 0.04) / 0.009;
-  float mmHg = pressure_kPa * 7.5006;
-  if (mmHg < 0) mmHg = 0; // approx conversion to mmHg
-  Serial.print("Pressure: ");
-  Serial.print(mmHg);
-  Serial.println(" mmHg");
-  return mmHg;
+    /*
+      readPressureSensor()
+
+      Purpose:
+      - Read the raw ADC value from the ADS1115 on channel 0 and convert
+        it to mmHg using calibration constants. Apply a small moving
+        average (MA_LEN samples) to smooth noise.
+
+      Inputs:
+      - Uses global calibration constants: ADC_ZERO, ADC_REF, BP_REF, and
+        mmHg_per_adc.
+
+      Outputs:
+      - Returns the smoothed pressure in mmHg (float).
+
+      Side effects:
+      - Updates a circular buffer `pressureBuffer` and the `bufferIndex`.
+
+      Notes & edge cases:
+      - Negative computed mmHgRaw values are clamped to zero.
+      - The moving average uses the fixed-length buffer; at startup the
+        buffer may contain zeros (initial transient) until filled with
+        real readings.
+    */
+    int16_t raw = ads.readADC_SingleEnded(0);
+    float mmHgRaw = (raw - ADC_ZERO) * mmHg_per_adc;
+    if (mmHgRaw < 0) mmHgRaw = 0;
+
+    pressureBuffer[bufferIndex] = mmHgRaw;
+    bufferIndex = (bufferIndex + 1) % MA_LEN;
+    float sum = 0;
+    for (int i = 0; i < MA_LEN; i++) sum += pressureBuffer[i];
+    float mmHgSmoothed = sum / MA_LEN;
+
+    return mmHgSmoothed;
+}
+
+void startPumpGradual(int pwmValue = 128) {
+    /*
+      startPumpGradual(pwmValue)
+
+      Purpose:
+      - Start the pump motor gradually by writing a PWM value to the ENA
+        PWM pin and setting direction pins for forward rotation.
+
+      Inputs:
+      - pwmValue: 0..255 approximate PWM duty (default 128) to control
+        pump speed. Uses Arduino `analogWrite()` to the ENA pin.
+
+      Side effects:
+      - Drives motor driver pins: sets IN1=HIGH, IN2=LOW to select
+        direction and writes PWM to ENA.
+
+      Notes:
+      - This helper assumes the pump is wired to the motor channel that
+        uses ENA/IN1/IN2. If your pump is on the other channel, either
+        change wiring or update this routine to use ENB/IN3/IN4.
+    */
+    analogWrite(ENA, pwmValue);
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+}
+
+void stopPump() {
+    /*
+      stopPump()
+
+      Purpose:
+      - Stop the pump by setting PWM to 0 and clearing direction pins.
+
+      Side effects:
+      - Writes ENA PWM = 0, IN1 = LOW, IN2 = LOW.
+
+      Notes:
+      - If the pump is wired to the other motor channel, update accordingly.
+    */
+    analogWrite(ENA, 0);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
 }
 
 
-// =====================================================
-// 🩸 BLOOD PRESSURE MEASUREMENT (MPX5050DP)
 
+// --- Hold cuff with pulsed solenoid ---
+int holdCuffWithPulsedValve(float pressures[], float oscillations[]) {
+    /*
+      holdCuffWithPulsedValve(pressures, oscillations)
+
+      Purpose:
+      - Keep the cuff inflated for a fixed `HOLD_TIME` while periodically
+        pulsing the solenoid valve to create transient oscillations. Collect
+        pressure samples and compute the per-sample oscillation magnitude
+        (absolute difference from previous sample).
+
+      Inputs:
+      - pressures[]: preallocated float array to store sampled pressures.
+      - oscillations[]: preallocated float array to store oscillation magnitudes.
+
+      Returns:
+      - Number of samples collected (int).
+
+      Behaviour:
+      - Pulses the solenoid at intervals defined by VALVE_OPEN_INTERVAL and
+        VALVE_OPEN_DURATION to briefly release pressure and then close the valve.
+      - If pressure falls below TARGET_PRESSURE - PRESSURE_TOPUP_THRESHOLD the
+        function briefly starts the pump to top-up pressure.
+      - Samples are taken every DEF_SAMPLE_INTERVAL ms. Each sample is stored
+        in `pressures` and `oscillations` arrays. The oscillation magnitude
+        is computed as fabs(current - last).
+
+      Timing & blocking:
+      - This function blocks and runs for up to HOLD_TIME ms (or until the
+        sample buffer is full). It uses delay() and calls updateMeasurementScreen
+        to reflect progress.
+
+      Edge cases:
+      - The function uses global `mmHg` to decide top-ups; ensure mmHg is
+        initialized before calling this function.
+      - Caller must allocate arrays large enough: size at least HOLD_TIME / DEF_SAMPLE_INTERVAL.
+    */
+    int maxSamples = HOLD_TIME / DEF_SAMPLE_INTERVAL;
+    float lastPressure = readPressureSensor();
+    pressures[0] = lastPressure;
+    oscillations[0] = 0;
+    int sampleCount = 1;
+
+    unsigned long startTime = millis();
+    unsigned long lastValveTime = millis();
+
+    while (sampleCount < maxSamples && millis() - startTime < HOLD_TIME) {
+        unsigned long now = millis();
+
+        // Pulse solenoid
+        if (now - lastValveTime >= VALVE_OPEN_INTERVAL) {
+            digitalWrite(ENB, LOW); // open solenoid
+            delay(VALVE_OPEN_DURATION);
+            digitalWrite(ENB, HIGH); // close solenoid
+            lastValveTime = now;
+        }
+
+        // Top-up pressure if dropped
+        if (mmHg < TARGET_PRESSURE - PRESSURE_TOPUP_THRESHOLD) {
+            startPumpGradual(120);
+            delay(40);
+            stopPump();
+        }
+
+        delay(DEF_SAMPLE_INTERVAL);
+        mmHg = readPressureSensor();
+        pressures[sampleCount] = mmHg;
+        oscillations[sampleCount] = fabs(mmHg - lastPressure);
+        lastPressure = mmHg;
+        updateMeasurementScreen("Calculating...", String((int)mmHg) + " mmHg");
+        sampleCount++;
+    }
+
+    return sampleCount;
+}
+
+
+// --- Blood pressure measurement ---
 void measureBloodPressure() {
-  Serial.println("\n[Blood Pressure Measurement Started]");
-  mark = 0;
-  systole = 0;
-  diastole = 0;
+    /*
+      measureBloodPressure()
 
-  // load screen once and update in-place
-  loadMeasurementScreen("Blood Pressure", "Inflating...", "");
-  delay(200);
+      Purpose:
+      - Perform a simple oscillometric blood pressure measurement using a
+        pump, solenoid valve, ADS1115 pressure readings and a pulse-based
+        analysis to estimate systolic and diastolic pressures.
 
-  // === Step 1: Inflate cuff ===
-  Serial.println("Inflating cuff...");
-  digitalWrite(ENB, HIGH);   // close solenoid (air can't escape)
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
+      High-level steps:
+      1. Inflate cuff gradually to TARGET_PRESSURE (stop at SAFETY_MAX).
+      2. Stop pump and hold cuff pressure while pulsing the valve to create
+         oscillations; collect pressure samples and per-sample oscillation
+         magnitudes.
+      3. Find the index of maximum oscillation (peak index) and use
+         heuristic thresholds to find systolic (first index before peak where
+         oscillation >= 50% of max) and diastolic (first index after peak
+         where oscillation <= 70% of max).
 
-  digitalWrite(ENA, HIGH);   // start pump
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
+      Outputs & side effects:
+      - Writes `systole` and `diastole` globals and stores them in
+        `last_systole` / `last_diastole` for display.
+      - Controls motor driver pins and solenoid (ENB) to inflate and
+        release the cuff. Updates LVGL UI during the procedure.
 
-  while (true) {
-    mmHg = readPressureSensor();
-    // show live pressure while inflating
-    updateMeasurementScreen("Inflating...", String((int)mmHg) + " mmHg");
-    if (mmHg >= 135) { // target inflation
-      Serial.println("Target pressure reached.");
-      break;
-    }
-    if (mmHg > 150) {
-      Serial.println("Safety stop: pressure >150 mmHg");
-      break;
-    }
-    delay(100);
-  }
+      Timing & blocking:
+      - This routine is blocking and may take tens of seconds depending on
+        inflation time and HOLD_TIME. Be careful calling it from contexts
+        where non-blocking behaviour is required.
 
-  // === Step 2: Stop pump, hold air ===
-  digitalWrite(ENA, LOW);
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  delay(500);
-
-  // === Step 3: Deflate slowly ===
-  Serial.println("Deflating cuff...");
-  digitalWrite(ENB, LOW); // open solenoid (air can escape)
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
-
-  unsigned long startDeflate = millis();
-  while (millis() - startDeflate < 15000) {
-    mmHg = readPressureSensor();
-    // update screen while deflating
-    updateMeasurementScreen("Deflating...", String((int)mmHg) + " mmHg");
-
-    // Detect systolic (pressure falling past 110–100 mmHg)
-    if ((mmHg <= 110) && (mark == 0)) {
-      systole = mmHg;
-      mark = 1;
-      Serial.print("Systolic detected: ");
-      Serial.println(systole);
-  // show detected systolic
-  updateMeasurementScreen("Systolic", String((int)systole) + " mmHg");
-    }
-
-    // Detect diastolic (pressure falling past 85–70 mmHg)
-    if ((mmHg <= 80) && (mark == 1)) {
-      diastole = mmHg;
-      mark = 2;
-      Serial.print("Diastolic detected: ");
-      Serial.println(diastole);
-  updateMeasurementScreen("Diastolic", String((int)diastole) + " mmHg");
-      break;
-    }
-
-    if (mmHg < 30) break; // fully deflated
-    // keep LVGL responsive
-    lv_tick_inc(20);
-    lv_timer_handler();
+      Caveats & calibration:
+      - The oscillometric thresholds and conversion from ADC to mmHg are
+        heuristic; validate with a calibrated manometer. The algorithm is a
+        simplified proof-of-concept and not clinically certified.
+    */
+    Serial.println("\n[Blood Pressure Measurement Started]");
+    systole = 0;
+    diastole = 0;
+    loadMeasurementScreen("Blood Pressure", "Inflating...", "");
     delay(200);
+
+    // Inflate cuff gradually
+    Serial.println("Inflating cuff gradually...");
+    digitalWrite(ENB, HIGH); // solenoid closed
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    startPumpGradual(110);
+
+    while (true) {
+        mmHg = readPressureSensor();
+        updateMeasurementScreen("Inflating...", String((int)mmHg) + " mmHg");
+        if (mmHg >= TARGET_PRESSURE || mmHg > SAFETY_MAX) break;
+        delay(DEF_SAMPLE_INTERVAL);
+        
+    }
+    stopPump();
+    delay(500);
+
+    // Hold cuff with pulsed solenoid and collect oscillations
+    Serial.println("Holding cuff with pulsed solenoid...");
+    int maxSamples = HOLD_TIME / DEF_SAMPLE_INTERVAL;
+    float pressures[maxSamples];
+    float oscillations[maxSamples];
+    int sampleCount = holdCuffWithPulsedValve(pressures, oscillations);
+
+    // Calculate systolic & diastolic
+  /*
+    Systolic/Diastolic detection (simple oscillometric heuristic)
+
+    Steps:
+    1. Find the sample index `peakIndex` where the oscillation amplitude
+     (absolute pressure change) is maximum. This roughly corresponds to
+     the Mean Arterial Pressure (MAP) location in classic oscillometry.
+
+    2. Systolic estimate: search from the start up to the peak for the
+     first sample where oscillation amplitude >= 50% of the peak
+     amplitude. The corresponding cuff pressure at that index is used
+     as the systolic pressure estimate.
+
+    3. Diastolic estimate: search from the peak forward for the first
+     sample where oscillation amplitude <= 70% of the peak amplitude.
+     The corresponding pressure at that index is used as the diastolic
+     estimate.
+
+    Notes and caveats:
+    - These 50% (systolic) and 70% (diastolic) thresholds are empirical
+    heuristics. Different devices and algorithms use other thresholds or
+    curve-fitting of the oscillation envelope to obtain more accurate
+    results.
+    - This method assumes the recorded `oscillations[]` values reflect
+    clean arterial pulses introduced by brief valve pulses. Noise,
+    motion artifacts, incorrect valve timing, or poor sensor
+    calibration will distort the envelope and produce incorrect values.
+    - The sample pressure arrays are indexed in time; ensure the arrays
+    have sufficient resolution (DEF_SAMPLE_INTERVAL) for your patient.
+  */
+  float maxOsc = 0;
+  int peakIndex = 0;
+  for (int i = 1; i < sampleCount; i++) {
+    if (oscillations[i] > maxOsc) {
+      maxOsc = oscillations[i];
+      peakIndex = i;
+    }
   }
 
-  // === Step 4: Ensure cuff is deflated ===
-  digitalWrite(ENB, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
+  for (int i = 0; i <= peakIndex; i++) {
+    if (oscillations[i] >= 0.5 * maxOsc) {
+      systole = pressures[i];
+      break;
+    }
+  }
 
-  Serial.println("---------------------------");
-  Serial.print("Final Systolic: "); Serial.println(systole);
-  Serial.print("Final Diastolic: "); Serial.println(diastole);
-  Serial.println("[Measurement Complete]");
-  Serial.println("---------------------------");
+  for (int i = peakIndex; i < sampleCount; i++) {
+    if (oscillations[i] <= 0.7 * maxOsc) {
+      diastole = pressures[i];
+      break;
+    }
+  }
+    updateMeasurementScreen("Systolic", String((int)systole) + " mmHg");
+    updateMeasurementScreen("Diastolic", String((int)diastole) + " mmHg");
+    Serial.println("---------------------------");
+    Serial.print("Final Systolic: "); Serial.println(systole);
+    Serial.print("Final Diastolic: "); Serial.println(diastole);
+    Serial.println("[Measurement Complete]");
+    Serial.println("---------------------------");
 
-  // store last values
-  last_systole = systole;
-  last_diastole = diastole;
+    // Release remaining air
+    digitalWrite(ENB, LOW);
 
-  // show final results briefly then return to main
-  updateMeasurementScreen("Done", String((int)last_systole) + "/" + String((int)last_diastole) + " mmHg");
-  lv_timer_handler();
-  delay(1200);
-  showMainScreen();
+    // store last values
+    last_systole = systole;
+    last_diastole = diastole;
+
+    // show final results briefly then return to main
+    updateMeasurementScreen("Done", String((int)last_systole) + "/" + String((int)last_diastole) + " mmHg");
+    lv_timer_handler();
+    delay(1200);
+    showMainScreen();
 }
+
 
 // ===================== GUI HELPERS =====================
 void my_flush_cb(lv_display_t * disp_ptr, const lv_area_t * area, uint8_t * px_map) {
@@ -512,15 +788,21 @@ void lvgl_init_display() {
   lv_obj_set_style_text_font(lbl_measure_title, &lv_font_montserrat_18, 0);
   lv_obj_align(lbl_measure_title, LV_ALIGN_TOP_MID, 0, 8);
 
+  // Measurement status (now placed above the main value and using bold font)
   lbl_measure_status = lv_label_create(scr_measure);
   lv_label_set_text(lbl_measure_status, "");
-  lv_obj_set_style_text_font(lbl_measure_status, &lv_font_montserrat_14, 0);
-  lv_obj_align(lbl_measure_status, LV_ALIGN_TOP_LEFT, 8, 56);
+  // use a slightly larger font for status (bold variant not available in this build)
+  lv_obj_set_style_text_font(lbl_measure_status, &lv_font_montserrat_20, 0);
+  // center the status under the title
+  lv_obj_align(lbl_measure_status, LV_ALIGN_CENTER, 0, 10);
 
+  // Measurement value (prominent, bold)
   lbl_measure_value = lv_label_create(scr_measure);
   lv_label_set_text(lbl_measure_value, "");
+  // use the large value font (bold variant not available here)
   lv_obj_set_style_text_font(lbl_measure_value, &lv_font_montserrat_26, 0);
-  lv_obj_align(lbl_measure_value, LV_ALIGN_CENTER, 0, 10);
+  // position the value directly below the status
+  lv_obj_align(lbl_measure_value, LV_ALIGN_CENTER, 0, 55);
 }
 
 void showMainScreen() {
