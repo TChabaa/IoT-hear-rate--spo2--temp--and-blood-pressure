@@ -25,8 +25,8 @@ Adafruit_ADS1115 ads;
 #define ENA 15
 #define IN1 16
 #define IN2 17
-#define IN3 7
-#define IN4 6
+#define IN3 12
+#define IN4 13
 #define ENB 14
 
 // ===================== VARIABLES =====================

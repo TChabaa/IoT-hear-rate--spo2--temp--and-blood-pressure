@@ -1,0 +1,7 @@
+adafruit/Adafruit BusIO@^1.17.4
+bodmer/TFT_eSPI@^2.5.43
+lvgl/lvgl@^9.3.0
+dfrobot/DFRobot_BloodOxygen_S@^1.0.0
+dfrobot/DFRobot_RTU@^1.0.3
+adafruit/Adafruit MLX90614 Library@^2.1.5
+adafruit/Adafruit ADS1X15@^2.6.0
